@@ -13,7 +13,6 @@ def rt_exponents(k):
     return ex
 
 def rt_eval(k, xi):
-    """RT_k = [P_k]^2 + xi * P~_k on local coordinates xi (n,2). Returns Phi (n,nb,2), Div (n,nb) w.r.t. xi."""
     ex = rt_exponents(k)
     n = xi.shape[0]; nb = len(ex)
     Phi = np.zeros((n, nb, 2)); Div = np.zeros((n, nb))
@@ -37,7 +36,6 @@ def pk_eval(k, xi):
     return np.stack(cols, axis=1)
 
 def p2_basis(L):
-    """P2 nodal basis (3 vertex + 3 edge-opposite-vertex functions) at barycentric points L (nq,3)."""
     nq = L.shape[0]
     N2 = np.zeros((nq, 6))
     for i in range(3):
@@ -47,7 +45,6 @@ def p2_basis(L):
     return N2
 
 def p2_grad(L, G):
-    """Gradients of the P2 basis: (nt,nq,6,2) from barycentric L (nq,3) and hat gradients G (nt,3,2)."""
     nt = G.shape[0]; nq = L.shape[0]
     dN2 = np.zeros((nt, nq, 6, 2))
     for i in range(3):
@@ -77,7 +74,6 @@ class MeshData:
         self.v2t = v2t
 
     def patch_key(self, a):
-        """Geometry signature of the patch of vertex a (relative coordinates, local indices, boundary flags)."""
         patch = self.v2t[a]
         rel = (self.V[self.T[[t for t, _ in patch]]] - self.V[a]) / self.h
         key = (tuple(np.round(rel.ravel(), 9)), tuple(kk for _, kk in patch),
@@ -85,7 +81,6 @@ class MeshData:
         return key
 
 def equilibrated_flux(md, uh, lam_h, k=2, check=True):
-    """Returns dict with eta_res, sigma coefficients (nt,nb), and consistency checks."""
     V, T, G, L, W, X = md.V, md.T, md.G, md.L, md.W, md.X
     nt, nq, nv = md.nt, md.nq, md.nv
     nb = (k + 1) * (k + 3); nm = (k + 1) * (k + 2) // 2
@@ -177,7 +172,6 @@ def equilibrated_flux(md, uh, lam_h, k=2, check=True):
     return out
 
 def local_liftings(md, uh, lam_h):
-    """Returns dict with R2 = <Res,r>^2/||grad r||^2, <Res,r>, ||grad r||^2 and patch count."""
     V, T, G, L, W = md.V, md.T, md.G, md.L, md.W
     nt, nq, nv = md.nt, md.nq, md.nv
     N2 = p2_basis(L); dN2 = p2_grad(L, G)
@@ -239,13 +233,11 @@ def local_liftings(md, uh, lam_h):
     return {"R2": res_r ** 2 / gr2, "res_r": res_r, "grad_r2": gr2, "sum_patch_energy": sum_patch_energy}
 
 def analytic_at_quad(md, ufun, gradfun):
-    """Normalised analytic eigenfunction and gradient at the quadrature points, plus its Rayleigh quotient."""
     U = ufun(md.X); nrm = np.sqrt(np.sum(md.W * U ** 2))
     U = U / nrm; Gr = gradfun(md.X) / nrm
     return U, Gr, np.sum(md.W * np.sum(Gr ** 2, axis=2))
 
 def single_errors(md, uh, Uex, Gex):
-    """(e, eps, ip) for one discrete eigenvector uh and a normalised analytic eigenfunction (sign fixed by ip >= 0)."""
     Uq = np.einsum("qk,tk->tq", md.L, uh[md.T]); Gu = np.einsum("tki,tk->ti", md.G, uh[md.T])
     ip = np.sum(md.W * Uq * Uex)
     s = 1.0 if ip >= 0 else -1.0
@@ -254,8 +246,6 @@ def single_errors(md, uh, Uex, Gex):
     return e, eps, abs(ip)
 
 def cluster_quantities(md, Uh, lam_h, Uex_list, lam_ex):
-    """E^2 = ||A^{1/2}(g0-gh)||_S2^2, eps = ||g0-gh||_S2^2, and the overlap matrix for a cluster.
-    Uh: (nv,J) discrete vectors; Uex_list: list of J normalised analytic eigenfunctions at quad points; lam_ex: exact values."""
     J = Uh.shape[1]
     Uq = np.einsum("qk,tkj->tqj", md.L, Uh[md.T])
     O = np.zeros((J, J))
@@ -267,13 +257,10 @@ def cluster_quantities(md, Uh, lam_h, Uex_list, lam_ex):
     return E2, eps, O
 
 def Q_h(lam_m, lam_M, E2, eps):
-    """Higher-order part of CDMSV 2020 (4.9), with eps = ||g0-gh||_S2^2 (so eps^2 = ||.||^4)."""
     return 3 * (lam_M - lam_m) ** 2 / (4 * lam_m) * eps ** 2 \
         + (3 / lam_m) * (1 + eps ** 2 / 4) * (2 * (1 + lam_M * eps / (4 * lam_m)) ** 2 * E2 ** 2 + 2 * lam_M ** 2 * eps ** 2)
 
 def ideal_delta(md, K, free, Gex_list, lam_ex):
-    """delta_{h,p} = ||(I-P_h) Pi_{<=p}||_{a->a} with P_h the Galerkin (a-orthogonal) projection onto V_h.
-    Gex_list: gradients (nt,nq,2) of the normalised exact eigenfunctions u_1..u_p; lam_ex their eigenvalues."""
     p = len(Gex_list)
     if p == 0:
         return 0.0
@@ -293,7 +280,6 @@ def ideal_delta(md, K, free, Gex_list, lam_ex):
     return float(np.sqrt(max(ev.max(), 0.0)))
 
 def prolong_structured(idx_c, idx_f, r):
-    """Prolongation matrix from a structured grid idx_c (coarse) to idx_f (fine) refined by factor r = 2^s (same diagonal)."""
     assert r in (2, 4, 8)
     if r > 2:
         # compose: build intermediate grid of size (coarse*2)
@@ -317,15 +303,12 @@ def prolong_structured(idx_c, idx_f, r):
     return sp.csr_matrix((vals, (rows, cols)), shape=(nf, nc))
 
 def grid_index(V, nx, ny, a=1.0):
-    """Reconstruct the (i,j) grid index array of a structured mesh from vertex coordinates."""
     idx = -np.ones((nx + 1, ny + 1), dtype=int)
     i = np.rint(V[:, 0] * nx / a).astype(int); j = np.rint(V[:, 1] * ny).astype(int)
     idx[i, j] = np.arange(len(V))
     return idx
 
 def dual_norm_lower_bound(mesh_fn, idx_c, levels, uh, lam_h):
-    """Lower bound ||grad w_f||^2 <= ||Res||_{-1}^2 by Galerkin on a nested mesh refined 'levels' times by 2.
-    mesh_fn(s) must return (V, T, bnd, idx) for refinement step s (s=0 is the coarse mesh)."""
     u = uh.copy(); idx_prev = idx_c
     for s in range(1, levels + 1):
         V, T, bnd, idx = mesh_fn(s)
