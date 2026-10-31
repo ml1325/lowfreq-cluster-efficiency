@@ -3,7 +3,6 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 def mesh_triangle(N):
-    """Structured mesh of the unit right triangle with legs on the axes. Returns (V, T, bnd)."""
     idx = -np.ones((N + 1, N + 1), dtype=int)
     V = []
     for j in range(N + 1):
@@ -23,7 +22,6 @@ def mesh_triangle(N):
     return V, T, bnd
 
 def mesh_rect(a, Nx, Ny):
-    """Structured mesh of (0,a)x(0,1). Returns (V, T, bnd)."""
     idx = np.arange((Nx + 1) * (Ny + 1)).reshape(Nx + 1, Ny + 1)
     xs = np.linspace(0, a, Nx + 1); ys = np.linspace(0, 1, Ny + 1)
     X, Y = np.meshgrid(xs, ys, indexing="ij")
@@ -39,7 +37,6 @@ def mesh_rect(a, Nx, Ny):
     return V, T, bnd
 
 def element_geometry(V, T):
-    """Areas (positive) and constant gradients of the P1 hat functions: G[t, k, :] = grad of hat at vertex k."""
     P = V[T]                                       # (nt, 3, 2)
     d1 = P[:, 1] - P[:, 0]; d2 = P[:, 2] - P[:, 0]
     det = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
@@ -54,7 +51,6 @@ def element_geometry(V, T):
     return area, G
 
 def edge_structure(T):
-    """Unique edges. Returns E (ne,2) with v0<v1, TE (nt,3) edge index opposite vertex k, and ET (ne,2) triangles (-1 if boundary)."""
     nt = len(T)
     loc = np.stack([T[:, [1, 2]], T[:, [2, 0]], T[:, [0, 1]]], axis=1)   # edge opposite vertex k
     loc_sorted = np.sort(loc, axis=2).reshape(-1, 2)
@@ -78,7 +74,6 @@ def assemble_p1(V, T):
     return K, M, area, G
 
 def eig_p1(K, M, free, k, sigma):
-    """k eigenpairs of K u = lam M u on free dofs, shift-invert around sigma. Returns lam (sorted), U (nv x k, zero on Dirichlet nodes), and algebraic residuals."""
     Kf = K[free][:, free].tocsc(); Mf = M[free][:, free].tocsc()
     lam, X = spla.eigsh(Kf, k=k, M=Mf, sigma=sigma, which="LM", tol=1e-12)
     order = np.argsort(lam); lam = lam[order]; X = X[:, order]
@@ -92,7 +87,6 @@ def eig_p1(K, M, free, k, sigma):
     return lam, U, res
 
 def assemble_cr(V, T):
-    """Crouzeix-Raviart: dof on edges, basis phi_e = 1 - 2 lambda_{opposite vertex}. Returns K, M, E, TE."""
     area, G = element_geometry(V, T)
     E, TE, ET = edge_structure(T)
     nt = len(T); ne = len(E)
@@ -106,7 +100,6 @@ def assemble_cr(V, T):
     return K, M, E, TE, bnd_edge
 
 def cr_lower_bounds(V, T, k, kappa=0.1893):
-    """Guaranteed lower bounds lam_k >= lam_CR,k / (1 + kappa^2 H^2 lam_CR,k) (Carstensen-Gedicke 2014, Thm 3.1), H = max diameter."""
     K, M, E, TE, bnd_edge = assemble_cr(V, T)
     free = ~bnd_edge
     Kf = K[free][:, free].tocsc(); Mf = M[free][:, free].tocsc()
@@ -118,7 +111,6 @@ def cr_lower_bounds(V, T, k, kappa=0.1893):
     return lam / (1.0 + kappa**2 * H**2 * lam), lam, H
 
 def dunavant(degree=8):
-    """Dunavant rule on the reference triangle (barycentric weights normalised to 1). degree 8: 16 points."""
     if degree <= 4:
         # 6-point degree-4
         a1, a2 = 0.445948490915965, 0.091576213509771
@@ -150,7 +142,6 @@ def dunavant(degree=8):
     return np.array(pts), np.array(w)
 
 def quad_points(V, T, degree=8):
-    """Physical quadrature points X[t,q,:], weights W[t,q] (including area), barycentric L[q,3]."""
     L, w = dunavant(degree)
     P = V[T]                                         # (nt,3,2)
     X = np.einsum("qk,tki->tqi", L, P)
@@ -193,15 +184,12 @@ def grad_u_rect(a, m, n, X):
                      n * np.pi * np.sin(m * np.pi * x / a) * np.cos(n * np.pi * y)], axis=-1)
 
 def normalise_analytic(ufun, X, W):
-    """L2 norm of an analytic function by quadrature (for normalising exact eigenfunctions)."""
     return np.sqrt(np.sum(W * ufun(X) ** 2))
 
 def p1_at_quad(U, T, L):
-    """Values of P1 function(s) U (nv or nv x k) at quadrature points: (nt, nq[, k])."""
     return np.einsum("qk,tk...->tq...", L, U[T])
 
 def p1_grad(U, T, G):
-    """Constant gradients per element of P1 function(s): (nt, 2[, k])."""
     return np.einsum("tki,tk...->ti...", G, U[T])
 
 if __name__ == "__main__":
