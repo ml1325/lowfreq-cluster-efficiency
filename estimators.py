@@ -69,9 +69,6 @@ def monomials(k, xi):
 
 
 def equilibrated_flux(m, uh, lam, k=1):
-    """Patchwise equilibrated flux of Cances et al. (2017) in RT_k.
-
-    Returns eta = ||grad u_h + sigma|| and sigma at the quadrature points."""
     nt, nq = m.nt, m.nq
     nb, nm = (k + 1) * (k + 3), (k + 1) * (k + 2) // 2
     xi = ((m.X - m.cK[:, None]) / m.sK[:, None, None]).reshape(-1, 2)
@@ -157,7 +154,6 @@ def p2_basis(L, G):
 
 
 def residual_lifting(m, uh, lam):
-    """Lower bound <Res, r>^2 / ||grad r||^2 <= ||Res||_{-1}^2, r = sum_a psi_a r_a with r_a in P_2 on each patch."""
     T, G, L, W = m.T, m.G, m.L, m.W
     N, dN = p2_basis(L, G)
     A6 = np.einsum("tq,tqid,tqjd->tij", W, dN, dN)
@@ -204,7 +200,6 @@ def residual_lifting(m, uh, lam):
 
 
 def cluster_errors(m, Uh, lam_h, Uex, lam):
-    """E^2 = ||A^(1/2)(g0 - gh)||^2, eps = ||g0 - gh||^2 (Hilbert-Schmidt) and O[i, j] = (u_ih, u_j)."""
     O = np.einsum("tq,tqi,jtq->ij", m.W, m.values(Uh), np.array(Uex))
     eps = 2 * len(lam) - 2 * np.sum(O**2)
     E2 = np.sum(lam) + np.sum(lam_h) - 2 * np.sum(O**2 * lam)
@@ -217,9 +212,6 @@ def Q_h(lam_m, lam_M, E2, eps):
 
 
 def angle_matrix(m, K, free, Gex, lam):
-    """D[k, l] = a((I - P_h) psi_k, (I - P_h) psi_l) for the a-normalised exact eigenfunctions psi_k.
-
-    delta_{h,p} of Eq. (6) is the square root of the largest eigenvalue of D[:p, :p]."""
     lu = spla.splu(K[free][:, free].tocsc())
     X = np.zeros((m.nv, len(Gex)))
     for k, g in enumerate(Gex):
