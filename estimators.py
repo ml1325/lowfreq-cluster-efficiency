@@ -1,322 +1,234 @@
 import numpy as np
-import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-from fem_core import element_geometry, edge_structure, quad_points, assemble_p1
+from fem import geometry, edges, dunavant
 
-def rt_exponents(k):
-    ex = []
-    for a in range(k + 1):
-        for b in range(k + 1 - a):
-            ex.append((0, a, b)); ex.append((1, a, b))
-    for a in range(k + 1):
-        ex.append((2, a, k - a))
-    return ex
 
-def rt_eval(k, xi):
-    ex = rt_exponents(k)
-    n = xi.shape[0]; nb = len(ex)
-    Phi = np.zeros((n, nb, 2)); Div = np.zeros((n, nb))
-    x, y = xi[:, 0], xi[:, 1]
-    for j, (t, a, b) in enumerate(ex):
-        mono = x**a * y**b
-        dmx = a * x**(a - 1) * y**b if a > 0 else np.zeros(n)
-        dmy = b * x**a * y**(b - 1) if b > 0 else np.zeros(n)
-        if t == 0:
-            Phi[:, j, 0] = mono; Div[:, j] = dmx
-        elif t == 1:
-            Phi[:, j, 1] = mono; Div[:, j] = dmy
-        else:
-            Phi[:, j, 0] = x * mono; Phi[:, j, 1] = y * mono
-            Div[:, j] = (a + b + 2) * mono
-    return Phi, Div
-
-def pk_eval(k, xi):
-    x, y = xi[:, 0], xi[:, 1]
-    cols = [x**a * y**b for a in range(k + 1) for b in range(k + 1 - a)]
-    return np.stack(cols, axis=1)
-
-def p2_basis(L):
-    nq = L.shape[0]
-    N2 = np.zeros((nq, 6))
-    for i in range(3):
-        N2[:, i] = L[:, i] * (2 * L[:, i] - 1)
-        j, kk = (i + 1) % 3, (i + 2) % 3
-        N2[:, 3 + i] = 4 * L[:, j] * L[:, kk]
-    return N2
-
-def p2_grad(L, G):
-    nt = G.shape[0]; nq = L.shape[0]
-    dN2 = np.zeros((nt, nq, 6, 2))
-    for i in range(3):
-        j, kk = (i + 1) % 3, (i + 2) % 3
-        dN2[:, :, i, :] = (4 * L[:, i] - 1)[None, :, None] * G[:, i][:, None, :]
-        dN2[:, :, 3 + i, :] = 4 * (L[:, kk][None, :, None] * G[:, j][:, None, :] + L[:, j][None, :, None] * G[:, kk][:, None, :])
-    return dN2
-
-class MeshData:
+class Mesh:
     def __init__(self, V, T, bnd, deg=8):
         self.V, self.T, self.bnd = V, T, bnd
         self.nv, self.nt = len(V), len(T)
-        self.area, self.G = element_geometry(V, T)
-        self.E, self.TE, self.ET = edge_structure(T)
-        self.bnd_edge = self.ET[:, 1] < 0
-        self.X, self.W, self.L = quad_points(V, T, deg)
-        self.nq = self.L.shape[0]
+        self.area, self.G = geometry(V, T)
+        self.E, self.TE, self.bnd_edge = edges(T)
+        self.L, w = dunavant(deg)
+        self.X = np.einsum("qk,tki->tqi", self.L, V[T])
+        self.W = self.area[:, None] * w
+        self.nq = len(w)
         P = V[T]
         self.cK = P.mean(axis=1)
-        self.sK = np.max([np.linalg.norm(P[:, 1] - P[:, 0], axis=1), np.linalg.norm(P[:, 2] - P[:, 0], axis=1),
-                          np.linalg.norm(P[:, 2] - P[:, 1], axis=1)], axis=0)
+        self.sK = np.max([np.linalg.norm(P[:, i] - P[:, j], axis=1) for i, j in [(1, 0), (2, 0), (2, 1)]], axis=0)
         self.h = self.sK.max()
-        v2t = [[] for _ in range(self.nv)]
+        self.v2t = [[] for _ in range(self.nv)]
         for t in range(self.nt):
-            for kk in range(3):
-                v2t[T[t, kk]].append((t, kk))
-        self.v2t = v2t
+            for k in range(3):
+                self.v2t[T[t, k]].append((t, k))
 
     def patch_key(self, a):
+        # patches with equal keys have equal local matrices
         patch = self.v2t[a]
         rel = (self.V[self.T[[t for t, _ in patch]]] - self.V[a]) / self.h
-        key = (tuple(np.round(rel.ravel(), 9)), tuple(kk for _, kk in patch),
-               tuple(bool(self.bnd_edge[self.TE[t, e]]) for t, _ in patch for e in range(3)), bool(self.bnd[a]))
-        return key
+        return (tuple(np.round(rel.ravel(), 9)), tuple(k for _, k in patch),
+                tuple(bool(self.bnd_edge[self.TE[t, e]]) for t, _ in patch for e in range(3)), bool(self.bnd[a]))
 
-def equilibrated_flux(md, uh, lam_h, k=2, check=True):
-    V, T, G, L, W, X = md.V, md.T, md.G, md.L, md.W, md.X
-    nt, nq, nv = md.nt, md.nq, md.nv
-    nb = (k + 1) * (k + 3); nm = (k + 1) * (k + 2) // 2
-    Xi = (X - md.cK[:, None, :]) / md.sK[:, None, None]
-    Phi, Div = rt_eval(k, Xi.reshape(-1, 2))
-    Phi = Phi.reshape(nt, nq, nb, 2); Div = Div.reshape(nt, nq, nb) / md.sK[:, None, None]
-    Pk = pk_eval(k, Xi.reshape(-1, 2)).reshape(nt, nq, nm)
-    H = np.einsum("tq,tqjd,tqld->tjl", W, Phi, Phi)
-    D = np.einsum("tq,tqj,tqm->tmj", W, Div, Pk)
-    Uq = np.einsum("qk,tk->tq", L, uh[T])
-    Gu = np.einsum("tki,tk->ti", G, uh[T])
-    # edge Gauss points, normal traces with the global edge normal
-    tg, _ = np.polynomial.legendre.leggauss(k + 1); tg = 0.5 * (tg + 1); ng = k + 1
-    Nrm = np.zeros((nt, 3, ng, nb))
+    def values(self, u):
+        return np.einsum("qk,tk...->tq...", self.L, u[self.T])
+
+    def grad(self, u):
+        return np.einsum("tki,tk->ti", self.G, u[self.T])
+
+    def exact(self, u, grad):
+        # L2-normalised exact eigenfunction and its gradient at the quadrature points
+        U = u(self.X)
+        nrm = np.sqrt(np.sum(self.W * U**2))
+        return U / nrm, grad(self.X) / nrm
+
+
+def rt_basis(k, xi):
+    # RT_k = [P_k]^2 + x P_k(homogeneous), monomials in the local coordinates xi
+    ex = [(c, a, b) for a in range(k + 1) for b in range(k + 1 - a) for c in (0, 1)]
+    ex += [(2, a, k - a) for a in range(k + 1)]
+    x, y = xi[:, 0], xi[:, 1]
+    Phi = np.zeros((len(xi), len(ex), 2))
+    Div = np.zeros((len(xi), len(ex)))
+    for j, (c, a, b) in enumerate(ex):
+        mono = x**a * y**b
+        if c == 0:
+            Phi[:, j, 0] = mono
+            Div[:, j] = a * x**(a - 1) * y**b if a else 0
+        elif c == 1:
+            Phi[:, j, 1] = mono
+            Div[:, j] = b * x**a * y**(b - 1) if b else 0
+        else:
+            Phi[:, j, 0] = x * mono
+            Phi[:, j, 1] = y * mono
+            Div[:, j] = (a + b + 2) * mono
+    return Phi, Div
+
+
+def monomials(k, xi):
+    return np.stack([xi[:, 0]**a * xi[:, 1]**b for a in range(k + 1) for b in range(k + 1 - a)], axis=1)
+
+
+def equilibrated_flux(m, uh, lam, k=1):
+    """Patchwise equilibrated flux of Cances et al. (2017) in RT_k.
+
+    Returns eta = ||grad u_h + sigma|| and sigma at the quadrature points."""
+    nt, nq = m.nt, m.nq
+    nb, nm = (k + 1) * (k + 3), (k + 1) * (k + 2) // 2
+    xi = ((m.X - m.cK[:, None]) / m.sK[:, None, None]).reshape(-1, 2)
+    Phi, Div = rt_basis(k, xi)
+    Phi = Phi.reshape(nt, nq, nb, 2)
+    Div = Div.reshape(nt, nq, nb) / m.sK[:, None, None]
+    Pk = monomials(k, xi).reshape(nt, nq, nm)
+    H = np.einsum("tq,tqjd,tqld->tjl", m.W, Phi, Phi)
+    D = np.einsum("tq,tqj,tqm->tmj", m.W, Div, Pk)
+    Uq, Gu = m.values(uh), m.grad(uh)
+
+    # normal traces at k + 1 Gauss points per edge, oriented by the global edge
+    s = (np.polynomial.legendre.leggauss(k + 1)[0] + 1) / 2
+    Nrm = np.zeros((nt, 3, k + 1, nb))
     for e in range(3):
-        g = md.TE[:, e]
-        A0 = V[md.E[g, 0]]; A1 = V[md.E[g, 1]]
-        d = A1 - A0; ln = np.linalg.norm(d, axis=1)
-        n = np.stack([d[:, 1], -d[:, 0]], axis=1) / ln[:, None]
-        for ig in range(ng):
-            xi = (A0 + tg[ig] * d - md.cK) / md.sK[:, None]
-            Ph, _ = rt_eval(k, xi)
-            Nrm[:, e, ig, :] = np.einsum("tjd,td->tj", Ph, n)
+        A0, A1 = m.V[m.E[m.TE[:, e], 0]], m.V[m.E[m.TE[:, e], 1]]
+        d = A1 - A0
+        normal = np.stack([d[:, 1], -d[:, 0]], axis=1) / np.linalg.norm(d, axis=1)[:, None]
+        for g in range(k + 1):
+            Ph, _ = rt_basis(k, (A0 + s[g] * d - m.cK) / m.sK[:, None])
+            Nrm[:, e, g] = np.einsum("tjd,td->tj", Ph, normal)
+
     sigma = np.zeros((nt, nb))
     cache = {}
-    max_cons = 0.0
-    for a in range(nv):
-        patch = md.v2t[a]
-        ne_ = len(patch); n_ = ne_ * nb
-        key = md.patch_key(a)
+    for a in range(m.nv):
+        patch = m.v2t[a]
+        n = len(patch) * nb
+        key = m.patch_key(a)
         if key not in cache:
-            Hp = np.zeros((n_, n_))
+            # constraints: divergence moments on each element, continuous normal trace inside the patch,
+            # zero normal trace on the patch boundary except on the Dirichlet boundary
+            Hp = np.zeros((n, n))
             rows = []
-            for i, (t, kk) in enumerate(patch):
-                sl = slice(i * nb, (i + 1) * nb)
-                Hp[sl, sl] = H[t]
-                for m in range(nm):
-                    row = np.zeros(n_); row[sl] = D[t, m]; rows.append(row)
-            seen = {}
-            for i, (t, kk) in enumerate(patch):
-                for e in range(3):
-                    seen.setdefault(md.TE[t, e], []).append((i, t, e))
-            for g, lst in seen.items():
-                if md.bnd_edge[g]:
-                    continue
-                for ig in range(ng):
-                    row = np.zeros(n_)
-                    for sgn, (i, t, e) in zip([1.0, -1.0], lst):
-                        row[i * nb:(i + 1) * nb] = sgn * Nrm[t, e, ig]
+            for i, (t, _) in enumerate(patch):
+                Hp[i * nb:(i + 1) * nb, i * nb:(i + 1) * nb] = H[t]
+                for q in range(nm):
+                    row = np.zeros(n)
+                    row[i * nb:(i + 1) * nb] = D[t, q]
                     rows.append(row)
-            C = np.array(rows)
-            Uc, Sc, Vt = np.linalg.svd(C, full_matrices=True)
+            shared = {}
+            for i, (t, _) in enumerate(patch):
+                for e in range(3):
+                    shared.setdefault(m.TE[t, e], []).append((i, t, e))
+            for edge, lst in shared.items():
+                if m.bnd_edge[edge]:
+                    continue
+                for g in range(k + 1):
+                    row = np.zeros(n)
+                    for sgn, (i, t, e) in zip([1, -1], lst):
+                        row[i * nb:(i + 1) * nb] = sgn * Nrm[t, e, g]
+                    rows.append(row)
+            # minimise ||sigma + psi_a grad u_h|| under the constraints (null-space method)
+            Uc, Sc, Vt = np.linalg.svd(np.array(rows))
             r = int((Sc > Sc.max() * 1e-10).sum())
-            pinv = Vt[:r].T * (1.0 / Sc[:r]) @ Uc[:, :r].T          # (n_, nc)
-            Nn = Vt[r:].T
-            Hn = Nn.T @ Hp @ Nn
-            cache[key] = (Hp, pinv, Nn, np.linalg.inv(Hn), C, ne_ * nm)
-        Hp, pinv, Nn, Hninv, C, ndiv = cache[key]
-        # data: divergence rhs and objective linear term
-        d_vec = np.zeros(C.shape[0]); bp = np.zeros(n_)
-        for i, (t, kk) in enumerate(patch):
-            psi = L[:, kk]
-            data = lam_h * Uq[t] * psi - Gu[t] @ G[t, kk]
-            d_vec[i * nm:(i + 1) * nm] = np.einsum("q,qm->m", W[t] * data, Pk[t])
-            bp[i * nb:(i + 1) * nb] = np.einsum("q,qjd,d->j", W[t] * psi, Phi[t], Gu[t])
-        cp = pinv @ d_vec
-        if check:
-            max_cons = max(max_cons, np.abs(C @ cp - d_vec).max() / max(1.0, np.abs(d_vec).max()))
-        z = Hninv @ (-(Nn.T @ (Hp @ cp + bp)))
-        c = cp + Nn @ z
-        for i, (t, kk) in enumerate(patch):
+            pinv = (Vt[:r].T / Sc[:r]) @ Uc[:, :r].T
+            Z = Vt[r:].T
+            R = Z @ np.linalg.inv(Z.T @ Hp @ Z) @ Z.T
+            cache[key] = ((np.eye(n) - R @ Hp) @ pinv[:, :len(patch) * nm], R)
+        Ad, R = cache[key]
+        f, b = np.zeros(len(patch) * nm), np.zeros(n)
+        for i, (t, j) in enumerate(patch):
+            psi = m.L[:, j]
+            f[i * nm:(i + 1) * nm] = (m.W[t] * (lam * Uq[t] * psi - Gu[t] @ m.G[t, j])) @ Pk[t]
+            b[i * nb:(i + 1) * nb] = np.einsum("q,qjd,d->j", m.W[t] * psi, Phi[t], Gu[t])
+        c = Ad @ f - R @ b
+        for i, (t, _) in enumerate(patch):
             sigma[t] += c[i * nb:(i + 1) * nb]
-    # eta_res and checks
-    Sq = np.einsum("tj,tqjd->tqd", sigma, Phi)                     # sigma at quad points
-    eta_res2 = np.sum(W * np.sum((Gu[:, None, :] + Sq) ** 2, axis=2))
-    out = {"eta_res": np.sqrt(eta_res2), "sigma": sigma, "n_patch_shapes": len(cache), "max_constraint_resid": max_cons}
-    if check:
-        divs = np.einsum("tj,tqj->tq", sigma, Div)
-        out["div_check"] = np.abs(divs - lam_h * Uq).max() / (lam_h * np.abs(Uq).max())
-        jump = 0.0
-        for g in range(len(md.E)):
-            if md.bnd_edge[g]:
-                continue
-            t1, t2 = md.ET[g]
-            e1 = int(np.where(md.TE[t1] == g)[0][0]); e2 = int(np.where(md.TE[t2] == g)[0][0])
-            v1 = Nrm[t1, e1] @ sigma[t1]; v2 = Nrm[t2, e2] @ sigma[t2]
-            jump = max(jump, np.abs(v1 - v2).max())
-        out["normal_jump"] = jump / max(1.0, np.abs(Sq).max())
-    return out
+    Sq = np.einsum("tj,tqjd->tqd", sigma, Phi)
+    eta = np.sqrt(np.sum(m.W * np.sum((Gu[:, None] + Sq)**2, axis=2)))
+    return eta, Sq
 
-def local_liftings(md, uh, lam_h):
-    V, T, G, L, W = md.V, md.T, md.G, md.L, md.W
-    nt, nq, nv = md.nt, md.nq, md.nv
-    N2 = p2_basis(L); dN2 = p2_grad(L, G)
-    A6 = np.einsum("tq,tqid,tqjd->tij", W, dN2, dN2)
-    m6 = np.einsum("tq,qi->ti", W, N2)
-    Uq = np.einsum("qk,tk->tq", L, uh[T])
-    Gu = np.einsum("tki,tk->ti", G, uh[T])
-    rq = np.zeros((nt, nq)); grq = np.zeros((nt, nq, 2))
+
+def p2_basis(L, G):
+    N = np.zeros((len(L), 6))
+    dN = np.zeros((len(G), len(L), 6, 2))
+    for i in range(3):
+        j, k = (i + 1) % 3, (i + 2) % 3
+        N[:, i] = L[:, i] * (2 * L[:, i] - 1)
+        N[:, 3 + i] = 4 * L[:, j] * L[:, k]
+        dN[:, :, i] = (4 * L[:, i] - 1)[None, :, None] * G[:, i][:, None]
+        dN[:, :, 3 + i] = 4 * (L[:, k][None, :, None] * G[:, j][:, None] + L[:, j][None, :, None] * G[:, k][:, None])
+    return N, dN
+
+
+def residual_lifting(m, uh, lam):
+    """Lower bound <Res, r>^2 / ||grad r||^2 <= ||Res||_{-1}^2, r = sum_a psi_a r_a with r_a in P_2 on each patch."""
+    T, G, L, W = m.T, m.G, m.L, m.W
+    N, dN = p2_basis(L, G)
+    A6 = np.einsum("tq,tqid,tqjd->tij", W, dN, dN)
+    m6 = W @ N
+    Uq, Gu = m.values(uh), m.grad(uh)
+    rq, grq = np.zeros((m.nt, m.nq)), np.zeros((m.nt, m.nq, 2))
     cache = {}
-    sum_patch_energy = 0.0
-    for a in range(nv):
-        patch = md.v2t[a]
-        key = md.patch_key(a)
-        # local dof numbering: vertices then edges
-        dofs = {}
-        loc_ids = []
-        for (t, kk) in patch:
-            ids = []
-            for i in range(3):
-                ids.append(dofs.setdefault(("v", T[t, i]), len(dofs)))
-            for i in range(3):
-                ids.append(dofs.setdefault(("e", md.TE[t, i]), len(dofs)))
-            loc_ids.append(ids)
+    for a in range(m.nv):
+        patch = m.v2t[a]
+        dofs, ids = {}, []
+        for t, _ in patch:
+            ids.append([dofs.setdefault(("v", T[t, i]), len(dofs)) for i in range(3)]
+                       + [dofs.setdefault(("e", m.TE[t, i]), len(dofs)) for i in range(3)])
         nd = len(dofs)
+        key = m.patch_key(a)
         if key not in cache:
-            A = np.zeros((nd, nd)); m = np.zeros(nd)
-            for (t, kk), ids in zip(patch, loc_ids):
-                A[np.ix_(ids, ids)] += A6[t]; m[ids] += m6[t]
-            if md.bnd[a]:
-                keep = np.array([not ((typ == "v" and md.bnd[idx]) or (typ == "e" and md.bnd_edge[idx]))
-                                 for (typ, idx) in dofs.keys()])
+            A, mean = np.zeros((nd, nd)), np.zeros(nd)
+            for (t, _), d in zip(patch, ids):
+                A[np.ix_(d, d)] += A6[t]
+                mean[d] += m6[t]
+            if m.bnd[a]:
+                # zero on the boundary of the domain
+                keep = np.array([not (m.bnd[i] if typ == "v" else m.bnd_edge[i]) for typ, i in dofs])
                 Ainv = np.zeros((nd, nd))
                 Ainv[np.ix_(keep, keep)] = np.linalg.inv(A[np.ix_(keep, keep)])
-                cache[key] = ("bnd", Ainv)
             else:
-                K = np.zeros((nd + 1, nd + 1)); K[:nd, :nd] = A; K[:nd, nd] = m; K[nd, :nd] = m
-                cache[key] = ("int", np.linalg.inv(K))
-        kind, Minv = cache[key]
+                # Neumann problem with zero mean
+                Kk = np.zeros((nd + 1, nd + 1))
+                Kk[:nd, :nd], Kk[:nd, nd], Kk[nd, :nd] = A, mean, mean
+                Ainv = np.linalg.inv(Kk)[:nd, :nd]
+            cache[key] = Ainv
         f = np.zeros(nd)
-        for (t, kk), ids in zip(patch, loc_ids):
-            psi = L[:, kk]; gpsi = G[t, kk]
-            # f_i = sum_q W [ lam u psi N_i - Gu . (N_i gpsi + psi dN_i) ]
-            fl = np.einsum("q,qi->i", W[t] * (lam_h * Uq[t] * psi - (Gu[t] @ gpsi)), N2) \
-                 - np.einsum("q,qid,d->i", W[t] * psi, dN2[t], Gu[t])
-            f[ids] += fl
-        if kind == "bnd":
-            r = Minv @ f
-        else:
-            r = (Minv @ np.concatenate([f, [0.0]]))[:nd]
-        for (t, kk), ids in zip(patch, loc_ids):
-            psi = L[:, kk]; gpsi = G[t, kk]
-            ra = N2 @ r[ids]                       # (nq,)
-            gra = np.einsum("qid,i->qd", dN2[t], r[ids])
+        for (t, k), d in zip(patch, ids):
+            psi = L[:, k]
+            f[d] += (W[t] * (lam * Uq[t] * psi - Gu[t] @ G[t, k])) @ N - np.einsum("q,qid,d->i", W[t] * psi, dN[t], Gu[t])
+        r = cache[key] @ f
+        for (t, k), d in zip(patch, ids):
+            psi = L[:, k]
+            ra = N @ r[d]
             rq[t] += psi * ra
-            grq[t] += ra[:, None] * gpsi[None, :] + psi[:, None] * gra
-        sum_patch_energy += float(r @ f)                 # = ||grad r^a||^2_{omega_a}
-    res_r = np.sum(W * (lam_h * Uq * rq)) - np.sum(np.einsum("tqd,td->tq", grq, Gu) * W)
-    gr2 = np.sum(W * np.sum(grq ** 2, axis=2))
-    return {"R2": res_r ** 2 / gr2, "res_r": res_r, "grad_r2": gr2, "sum_patch_energy": sum_patch_energy}
+            grq[t] += ra[:, None] * G[t, k] + psi[:, None] * np.einsum("qid,i->qd", dN[t], r[d])
+    res_r = np.sum(W * lam * Uq * rq) - np.sum(W * np.einsum("tqd,td->tq", grq, Gu))
+    return res_r**2 / np.sum(W * np.sum(grq**2, axis=2))
 
-def analytic_at_quad(md, ufun, gradfun):
-    U = ufun(md.X); nrm = np.sqrt(np.sum(md.W * U ** 2))
-    U = U / nrm; Gr = gradfun(md.X) / nrm
-    return U, Gr, np.sum(md.W * np.sum(Gr ** 2, axis=2))
 
-def single_errors(md, uh, Uex, Gex):
-    Uq = np.einsum("qk,tk->tq", md.L, uh[md.T]); Gu = np.einsum("tki,tk->ti", md.G, uh[md.T])
-    ip = np.sum(md.W * Uq * Uex)
-    s = 1.0 if ip >= 0 else -1.0
-    eps = np.sum(md.W * (Uq - s * Uex) ** 2)
-    e = np.sum(md.W * np.sum((Gu[:, None, :] - s * Gex) ** 2, axis=2))
-    return e, eps, abs(ip)
-
-def cluster_quantities(md, Uh, lam_h, Uex_list, lam_ex):
-    J = Uh.shape[1]
-    Uq = np.einsum("qk,tkj->tqj", md.L, Uh[md.T])
-    O = np.zeros((J, J))
-    for i in range(J):
-        for j in range(J):
-            O[i, j] = np.sum(md.W * Uq[:, :, i] * Uex_list[j])
-    eps = 2 * J - 2 * np.sum(O ** 2)
-    E2 = np.sum(lam_ex) + np.sum(lam_h) - 2 * np.sum(O ** 2 * np.asarray(lam_ex)[None, :])
+def cluster_errors(m, Uh, lam_h, Uex, lam):
+    """E^2 = ||A^(1/2)(g0 - gh)||^2, eps = ||g0 - gh||^2 (Hilbert-Schmidt) and O[i, j] = (u_ih, u_j)."""
+    O = np.einsum("tq,tqi,jtq->ij", m.W, m.values(Uh), np.array(Uex))
+    eps = 2 * len(lam) - 2 * np.sum(O**2)
+    E2 = np.sum(lam) + np.sum(lam_h) - 2 * np.sum(O**2 * lam)
     return E2, eps, O
 
+
 def Q_h(lam_m, lam_M, E2, eps):
-    return 3 * (lam_M - lam_m) ** 2 / (4 * lam_m) * eps ** 2 \
-        + (3 / lam_m) * (1 + eps ** 2 / 4) * (2 * (1 + lam_M * eps / (4 * lam_m)) ** 2 * E2 ** 2 + 2 * lam_M ** 2 * eps ** 2)
+    return 3 * (lam_M - lam_m)**2 / (4 * lam_m) * eps**2 \
+        + 3 / lam_m * (1 + eps**2 / 4) * (2 * (1 + lam_M * eps / (4 * lam_m))**2 * E2**2 + 2 * lam_M**2 * eps**2)
 
-def ideal_delta(md, K, free, Gex_list, lam_ex):
-    p = len(Gex_list)
-    if p == 0:
-        return 0.0
-    Kf = K[free][:, free].tocsc()
-    lu = spla.splu(Kf)
-    Xp = np.zeros((md.nv, p))
-    for k in range(p):
-        # rhs_j = (grad u_k, grad phi_j) = sum_t sum_q W grad u_k . G[t,j]
-        rhs = np.zeros(md.nv)
-        contrib = np.einsum("tq,tqd,tjd->tj", md.W, Gex_list[k], md.G)      # (nt,3)
-        np.add.at(rhs, md.T.ravel(), contrib.ravel())
-        x = np.zeros(md.nv); x[free] = lu.solve(rhs[free]); Xp[:, k] = x
-    Gram = Xp.T @ (K @ Xp)                                                     # a(P_h u_k, P_h u_l)
-    scale = 1.0 / np.sqrt(np.asarray(lam_ex))
-    Mres = np.eye(p) - scale[:, None] * Gram * scale[None, :]                 # a((I-P_h)psi_k, (I-P_h)psi_l)
-    ev = np.linalg.eigvalsh(Mres)
-    return float(np.sqrt(max(ev.max(), 0.0)))
 
-def prolong_structured(idx_c, idx_f, r):
-    assert r in (2, 4, 8)
-    if r > 2:
-        # compose: build intermediate grid of size (coarse*2)
-        raise NotImplementedError
-    nf = idx_f.max() + 1; nc = idx_c.max() + 1
-    rows, cols, vals = [], [], []
-    I, J = np.nonzero(idx_f >= 0)
-    for i, j in zip(I, J):
-        f = idx_f[i, j]
-        if i % 2 == 0 and j % 2 == 0:
-            rows.append(f); cols.append(idx_c[i // 2, j // 2]); vals.append(1.0)
-        elif i % 2 == 1 and j % 2 == 0:
-            for c in (idx_c[(i - 1) // 2, j // 2], idx_c[(i + 1) // 2, j // 2]):
-                rows.append(f); cols.append(c); vals.append(0.5)
-        elif i % 2 == 0 and j % 2 == 1:
-            for c in (idx_c[i // 2, (j - 1) // 2], idx_c[i // 2, (j + 1) // 2]):
-                rows.append(f); cols.append(c); vals.append(0.5)
-        else:
-            for c in (idx_c[(i + 1) // 2, (j - 1) // 2], idx_c[(i - 1) // 2, (j + 1) // 2]):
-                rows.append(f); cols.append(c); vals.append(0.5)
-    return sp.csr_matrix((vals, (rows, cols)), shape=(nf, nc))
+def angle_matrix(m, K, free, Gex, lam):
+    """D[k, l] = a((I - P_h) psi_k, (I - P_h) psi_l) for the a-normalised exact eigenfunctions psi_k.
 
-def grid_index(V, nx, ny, a=1.0):
-    idx = -np.ones((nx + 1, ny + 1), dtype=int)
-    i = np.rint(V[:, 0] * nx / a).astype(int); j = np.rint(V[:, 1] * ny).astype(int)
-    idx[i, j] = np.arange(len(V))
-    return idx
+    delta_{h,p} of Eq. (6) is the square root of the largest eigenvalue of D[:p, :p]."""
+    lu = spla.splu(K[free][:, free].tocsc())
+    X = np.zeros((m.nv, len(Gex)))
+    for k, g in enumerate(Gex):
+        rhs = np.zeros(m.nv)
+        np.add.at(rhs, m.T.ravel(), np.einsum("tq,tqd,tjd->tj", m.W, g, m.G).ravel())
+        X[free, k] = lu.solve(rhs[free])
+    s = 1 / np.sqrt(lam)
+    return np.eye(len(Gex)) - s[:, None] * (X.T @ (K @ X)) * s[None, :]
 
-def dual_norm_lower_bound(mesh_fn, idx_c, levels, uh, lam_h):
-    u = uh.copy(); idx_prev = idx_c
-    for s in range(1, levels + 1):
-        V, T, bnd, idx = mesh_fn(s)
-        P = prolong_structured(idx_prev, idx, 2)
-        u = P @ u; idx_prev = idx
-    K, M, _, _ = assemble_p1(V, T)
-    free = ~bnd
-    res = lam_h * (M @ u) - K @ u
-    Kf = K[free][:, free].tocsc()
-    w = spla.spsolve(Kf, res[free])
-    return float(res[free] @ w), len(V)
+
+def angle(D, p):
+    return np.sqrt(max(np.linalg.eigvalsh(D[:p, :p]).max(), 0)) if p else 0.0
